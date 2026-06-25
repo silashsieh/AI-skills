@@ -1,0 +1,4 @@
+interface:
+  display_name: "Resume MD-LaTeX-PDF Sync"
+  short_description: "Sync resume Markdown to LaTeX and PDF."
+  default_prompt: "Use $resume-md-latex-pdf-sync to sync the resume Markdown variants to LaTeX and rebuilt PDFs with verification."

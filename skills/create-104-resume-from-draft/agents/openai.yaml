@@ -1,0 +1,4 @@
+interface:
+  display_name: "Create 104 Resume From Draft"
+  short_description: "Copy and tailor a complete 104 resume from job files"
+  default_prompt: "Use $create-104-resume-from-draft to copy a complete existing 104 resume and tailor it for my target company in the current cmux browser."

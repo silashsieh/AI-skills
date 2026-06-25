@@ -1,0 +1,20 @@
+{
+  "name": "ai-skills",
+  "description": "Silas Hsieh's personal skill library: coupon calendar/ICS automation and resume Markdown-to-LaTeX-to-PDF sync plus 104 resume tailoring workflows.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Silas Hsieh"
+  },
+  "homepage": "https://github.com/silashsieh/AI-skills",
+  "repository": "https://github.com/silashsieh/AI-skills",
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "resume",
+    "latex",
+    "calendar",
+    "coupon",
+    "104",
+    "automation"
+  ]
+}

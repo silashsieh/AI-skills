@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fetch 104 Job Data via Browser"
+  short_description: "Capture clean JSON from 104.com.tw via a real browser session."
+  default_prompt: "Use $fetch-104-jobs to pull 104 job listings as JSON by hooking the site's own XHR in the open Chrome tab."

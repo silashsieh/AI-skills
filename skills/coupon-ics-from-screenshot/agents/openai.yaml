@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coupon ICS from Screenshot"
+  short_description: "Create Apple Calendar ICS coupon expiry events from screenshots."
+  default_prompt: "Create an ICS file from coupon screenshots, using expiry dates as all-day events."
