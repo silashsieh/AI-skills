@@ -15,7 +15,7 @@ skill directories just symlink back to it (see [Install](#install)).
 | --- | --- |
 | [`coupon-ics-from-screenshot`](skills/coupon-ics-from-screenshot/SKILL.md) | Generate an Apple Calendar–compatible `.ics` file from coupon screenshots — all-day events keyed to due dates, no `VALARM` unless asked, with iCalendar validation. |
 | [`create-104-resume-from-draft`](skills/create-104-resume-from-draft/SKILL.md) | Build or refresh a company-specific 104 resume from an existing job-application package, tailoring only the attachment, self-introduction, and 專長 while preserving shared fields. Stops before submitting. |
-| [`fetch-104-jobs`](skills/fetch-104-jobs/SKILL.md) | Pull structured job/company data from 104 人力銀行 through a real browser session, bypassing Cloudflare. Hooks the site's own XHR and triggers an in-place fetch to capture clean JSON (direct API requests return 403). **⚠️ For web-service research/education only; may violate 104's ToS.** |
+| [`fetch-104-jobs`](skills/fetch-104-jobs/SKILL.md) | Pull structured job/company data from 104 人力銀行 through a real browser session, bypassing Cloudflare. Issues a same-origin `fetch()` of 104's JSON API from the open Chrome tab (the browser supplies clearance + TLS fingerprint); falls back to XHR capture if the anti-bot layer 403s. **⚠️ For web-service research/education only; may violate 104's ToS.** |
 | [`resume-md-latex-pdf-sync`](skills/resume-md-latex-pdf-sync/SKILL.md) | Sync resume Markdown drafts to matching LaTeX and rebuilt PDFs (latexmk/XeLaTeX), preserving V5/V5.1 layout conventions and verifying Markdown ↔ LaTeX ↔ extracted PDF text ↔ rendered pages all agree. |
 
 ## Layout

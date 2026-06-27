@@ -1,13 +1,29 @@
 ---
 name: fetch-104-jobs
-description: Fetch structured job and company data from 104 人力銀行 (104.com.tw) through a real browser session. Use when asked to pull, scrape, or enumerate 104 job listings, job details, or a company's openings as clean JSON, when direct HTTP requests are blocked by Cloudflare, or when a previous fetch returned 403. Drives an already-open Chrome tab via the claude-in-chrome MCP tools.
+description: Fetch structured job and company data from 104 人力銀行 (104.com.tw) through a real browser session. Use when asked to pull, scrape, or enumerate 104 job listings, job details, or a company's openings as clean JSON. The reliable path is a same-origin `fetch()` of 104's JSON API from inside an already-open Chrome tab (claude-in-chrome MCP) — the browser supplies the Cloudflare clearance and TLS fingerprint. Use this skill when direct HTTP/curl requests are blocked by Cloudflare or returned 403.
 ---
 
 # Fetch 104 Job Data via Browser
 
-104.com.tw sits behind Cloudflare **and** a second anti-bot layer. A real
-browser session is the reliable way in, but you cannot just `fetch()` the JSON
-API — you must let the site's own app make the request and capture it.
+104.com.tw sits behind Cloudflare. The reliable way in is a **real browser
+session**: load any 104 page (which passes the Cloudflare challenge and sets the
+`cf_clearance` cookie), then make a **same-origin `fetch()`** of 104's JSON API
+*from that tab*. The request rides the genuine browser session — real TLS
+fingerprint, real cookies — so it returns clean JSON with no scraping.
+
+This is the same insight as the `curl_cffi impersonate="chrome"` trick that
+out-of-browser tools use to forge a Chrome TLS fingerprint — except a real
+Chrome **is** a real Chrome, so you skip the impersonation entirely and let the
+browser you already control issue the request.
+
+> **Verified 2026-06-26:** a same-origin `fetch()` with `credentials:"include"`
+> returns **200 + full JSON** for the search, job-detail, and company endpoints —
+> no XHR hook, no sort-trigger, no blob-download.
+>
+> ⚠️ A 2026-06-25 test of the *same* fetch returned **403**, which is why the
+> XHR-capture technique below exists. 104's anti-bot behavior is **inconsistent**
+> across days/sessions. **Try the direct fetch first; if it 403s, fall back to
+> [XHR capture](#fallback-a-direct-fetch-returns-403).**
 
 ## ⚠️ Purpose and legal notice
 
@@ -26,53 +42,216 @@ liability. If in doubt, don't — use 104's official channels instead.
   personal 104 account — an anonymous session carrying only `cf_clearance` is
   enough and is less attributable.
 - Read only public job listings — the same data the page already renders.
-- Keep request volume low. This is personal, occasional research, not a bulk
-  crawler. Respect 104's Terms of Service and `robots.txt`.
+- Keep request volume low and pace yourself (≥1 s between calls). This is
+  personal, occasional research, not a bulk crawler. Respect 104's Terms of
+  Service and `robots.txt`.
 - Never enter credentials, never submit an application, never post anything.
 
-## What works and what does not (verified 2026-06-25)
+## The approach in three steps
 
-| Approach | Result |
-|---|---|
-| Real browser loads 104 pages | ✅ passes Cloudflare (`cf_clearance` is valid) |
-| The site's **own** XHR to `/jobs/search/api/jobs` | ✅ 200 + full JSON |
-| Manual `fetch()` of the same endpoint (isolated world) | ❌ 403 |
-| Manual `fetch()` injected into the page's **main** world | ❌ 403 |
-| Rendered DOM cards | ✅ present, scrapeable |
+1. **Navigate** a Chrome tab to a 104 page (passes Cloudflare → sets
+   `cf_clearance`, and makes subsequent calls same-origin).
+2. **`fetch()`** the JSON API from that tab with `credentials:"include"`.
+3. **Parse in-page and return a structured projection** — an array of objects
+   with short fields, never one giant JSON string (see
+   [the truncation rule](#3-return-structured-data-never-one-big-string)).
 
-The site's app uses **`XMLHttpRequest` (axios), not `fetch`**. `cf_clearance`
-clears Cloudflare but a raw request still fails the second layer (the app
-attaches per-session context a hand-rolled request can't reproduce). So:
+All JS runs through the `javascript_tool` MCP tool (isolated world). That world
+**can** issue a successful same-origin `fetch()` because cookies are per-origin,
+not per-world — no main-world `<script>` injection or `localStorage` bridge is
+needed for the happy path.
 
-> **Do not blind-fetch the API.** Hook the app's own XHR and trigger the app to
-> call the API, then read the captured response.
+> Using cmux's WKWebView browser instead? The technique is identical; only the
+> command mechanics differ — see [cmux browser variant](#cmux-browser-variant).
 
 ## Recipe (Chrome + claude-in-chrome MCP)
 
-All JS runs through the `javascript_tool` MCP tool (isolated world). The hook
-must be injected into the **main world** via a `<script>` tag. Cross-world
-hand-off goes through the shared `localStorage` and DOM, never a `window` var.
+### 1. Navigate to a 104 page
 
-> Using cmux's WKWebView browser instead? The technique is identical but the
-> command mechanics differ — see [cmux browser variant](#cmux-browser-variant).
-
-### 1. Navigate to the target
+Any `www.104.com.tw` page works (it just needs to clear Cloudflare and be
+same-origin with the API). The natural choice is the search page itself:
 
 ```
 https://www.104.com.tw/jobs/search/?keyword=<kw>&jobsource=index_s          # search
 https://www.104.com.tw/job/<slug>                                            # one job (slug, NOT numeric jobNo)
-https://www.104.com.tw/company/<cust_id>?tab=job                             # a company's jobs
+https://www.104.com.tw/company/<short_code>?tab=job                          # a company's jobs
 ```
 
-After navigating, the page renders results into the DOM. Wait ~1–2 s for the
-Vue app to hydrate.
+Wait ~1–2 s after navigating. (You don't need the DOM to hydrate for the fetch
+to work — you only need the page loaded so `cf_clearance` is set — but a brief
+wait avoids racing the initial challenge.)
 
-### 2. Install the XHR/fetch capture hook (main world)
+### 2. Fetch the JSON API directly
 
-Idempotent; records any `/api/` or `/ajax/` response into `localStorage` under
-`__cap_<n>` keys. Stores the full body separately so large payloads survive.
+A reusable helper. The three headers mirror what 104's own app sends; the
+`Referer` should point at a matching 104 page.
 
 ```js
+await (async () => {
+  async function api(url, ref) {
+    const r = await fetch(url, {
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-TW,zh;q=0.9',
+        'Referer': ref || 'https://www.104.com.tw/jobs/search/'
+      },
+      credentials: 'include'      // attaches cf_clearance; required
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);   // 403 here => use Fallback A
+    return r.json();
+  }
+  const j = await api('https://www.104.com.tw/jobs/search/api/jobs?keyword=SRE&order=16&page=1&pagesize=20&kwop=7');
+  // ... project & return (see step 3)
+})();
+```
+
+### 3. Return STRUCTURED data, never one big string
+
+The MCP/tool layer **truncates each individual string value in a return at
+~1000 chars** (verified). A page of ~20 results stringified is ~30–130 KB, so
+**never `return JSON.stringify(wholeResponse)`** — it gets cut mid-string.
+
+Instead, **parse in-page and return an array of objects with short fields**.
+Many short strings pass fine; only a single >1000-char string gets clipped.
+
+```js
+await (async () => {
+  const r = await fetch('https://www.104.com.tw/jobs/search/api/jobs?keyword=SRE&order=16&page=1&pagesize=20&kwop=7', {
+    headers: { 'Accept':'application/json, text/plain, */*', 'Accept-Language':'zh-TW,zh;q=0.9', 'Referer':'https://www.104.com.tw/jobs/search/' },
+    credentials: 'include'
+  });
+  if (!r.ok) return 'HTTP ' + r.status;          // 403 => Fallback A
+  const j = await r.json();
+  return {
+    total: j.metadata.pagination.total,
+    page:  j.metadata.pagination.currentPage,
+    last:  j.metadata.pagination.lastPage,
+    jobs: j.data.map(d => ({
+      name:  d.jobName,
+      co:    d.custName,
+      area:  d.jobAddrNoDesc,
+      sal:   d.salaryDesc,
+      appear: d.appearDate,
+      applies: d.applyCnt,
+      slug:  (String(d.link && d.link.job ).match(/\/job\/([^?]+)/)    || [])[1],  // for job detail
+      coShort: (String(d.link && d.link.cust).match(/\/company\/([^?]+)/)|| [])[1]  // short code for company API
+    }))
+  };
+})();
+```
+
+**Long single fields** (a full job description from the detail endpoint can
+exceed 1000 chars) will still clip. For those: return them split into chunks,
+or use [Fallback B (blob-download)](#fallback-b-need-the-full-raw-payload-on-disk),
+or read the rendered DOM ([DOM fallback](#dom-fallback)).
+
+### Job detail
+
+```js
+await (async () => {
+  const slug = '91u53';  // from a search result's link.job
+  const r = await fetch('https://www.104.com.tw/job/ajax/content/' + slug, {
+    headers: { 'Accept':'application/json, text/plain, */*', 'Referer':'https://www.104.com.tw/job/' + slug },
+    credentials: 'include'
+  });
+  if (!r.ok) return 'HTTP ' + r.status;
+  const d = (await r.json()).data;
+  return {
+    name: d.header && d.header.jobName,
+    co:   d.header && d.header.custName,
+    coShort: d.custNo,                              // SHORT code here (not numeric)
+    salary: d.jobDetail && d.jobDetail.salary,
+    descLen: (d.jobDetail && d.jobDetail.jobDescription || '').length,  // long: chunk/disk if you need the text
+    needExp: d.condition && d.condition.workExp,
+    edu:     d.condition && d.condition.edu
+  };
+})();
+```
+
+### A company's openings
+
+The company-jobs endpoint takes the **short code** (e.g. `dbgeqqo` from a result's
+`link.cust` → `/company/dbgeqqo`), **not** the numeric `custNo`. Passing the
+numeric id returns `totalCount: 0`.
+
+```js
+await (async () => {
+  const code = 'dbgeqqo';
+  const r = await fetch('https://www.104.com.tw/api/companies/' + code + '/jobs?page=1&pageSize=20', {
+    headers: { 'Accept':'application/json, text/plain, */*', 'Referer':'https://www.104.com.tw/company/' + code + '?tab=job' },
+    credentials: 'include'
+  });
+  if (!r.ok) return 'HTTP ' + r.status;
+  const data = (await r.json()).data;
+  return {
+    total: data.totalCount, pages: data.totalPages,
+    jobs: (data.list.normalJobs || []).map(j => ({ name: j.jobName, appear: j.appearDate }))
+  };
+})();
+```
+
+## Endpoint and parameter reference
+
+Reachable via same-origin `fetch()` from a loaded 104 tab (`credentials:"include"`):
+
+| Endpoint | Returns |
+|---|---|
+| `/jobs/search/api/jobs?keyword=&order=&page=&pagesize=20&kwop=7` | search results (`data[]` + `metadata.pagination`) |
+| `/job/ajax/content/<slug>` | one job's full detail (`data.header / jobDetail / condition`; `data.custNo` = **short** company code) |
+| `/api/companies/<short_code>/jobs?page=1&pageSize=20` | a company's openings, paginated |
+| `/api/companies/<short_code>/content` · `/news` | company profile / news |
+| `/api/companies/ratings?custNos=<numeric>` | company ratings (numeric `custNo`) |
+| `/jobs/search/ajax/cards` | UI flags (student/résumé cards) — not job data |
+
+**Search query parameters** (names + codes from the `job104-mcp` project, cross-checked live):
+
+| Param | Meaning | Values |
+|---|---|---|
+| `keyword` | search term | free text |
+| `kwop` | keyword operator | `7` (match all) |
+| `order` | sort | `15` relevance (default) · `16` newest · `13` salary |
+| `page` / `pagesize` | pagination | `pagesize` ≈ 20 per page |
+| `area` | location code(s) | from `Area.json` (comma-joined) |
+| `jobcat` | job-category code(s) | from `JobCat.json` (comma-joined) |
+| `scmin` | minimum salary | integer |
+| `scstrict` | enforce salary floor | `1` |
+| `remoteWork` | remote | `1` full · `2` partial (combine `1,2`) |
+| `wt` | employment type | `1` 全職 · `2` 兼職 · `3` 高階 · `4` 派遣 · `5` 接案 |
+| `jobexp` | required experience | years (string) |
+| `edu` | education level | code (string) |
+| `isnew` | recency filter | days (job104-mcp sends `7`) |
+
+`custNo` has two forms: the **short code** (`dbgeqqo`, used in `/company/` URLs,
+`/api/companies/`, and the job-detail `data.custNo`) vs the **numeric** id
+(`28990860000`, used in search `data[].custNo` and the ratings endpoint). They
+are not interchangeable.
+
+### Code tables (no browser needed)
+
+Area and job-category codes are static and **not** behind Cloudflare — fetch them
+with a plain `fetch`/curl from anywhere:
+
+```
+https://static.104.com.tw/category-tool/json/Area.json      # area codes
+https://static.104.com.tw/category-tool/json/JobCat.json    # job-category codes
+```
+
+Resolve a Chinese name (e.g. 台北市, 軟體工程師) to its code here, then pass the
+code as `area` / `jobcat`. Cache them locally; they change rarely.
+
+## Fallback A: direct fetch returns 403
+
+If step 2 throws `HTTP 403`, 104's second anti-bot layer is active this session.
+Don't fight it with headers — **no header set makes a raw fetch pass** when this
+layer is on. Instead, let the site's **own** app issue the request and capture
+the response. (104's app uses `XMLHttpRequest`/axios, not `fetch`.)
+
+Inject a capture hook into the **main world** (the `javascript_tool` isolated
+world can't see the app's XHR), then trigger an in-place re-fetch and read the
+captured body from `localStorage`.
+
+```js
+// 1. install hook (main world via <script>); idempotent; records /api/ & /ajax/ responses
 await (async () => {
   Object.keys(localStorage).filter(k=>/^__cap/.test(k)).forEach(k=>localStorage.removeItem(k));
   const tag = document.createElement('script');
@@ -90,184 +269,140 @@ await (async () => {
 })()
 ```
 
-### 3. Trigger the app to call the API — **in place**
-
-The hook is installed *after* page load, so it misses the initial request.
-Make the app fire a fresh request **without navigating**:
-
-- **Search page:** click a **sort** control (`本日最新` / `薪資待遇` / `相關性`)
-  or toggle a filter. This re-calls `/jobs/search/api/jobs` via XHR → 200.
-- ⚠️ **Pagination (`下一頁`, page numbers) is a FULL PAGE RELOAD** — it wipes the
-  hook and the request fires before you can re-attach. To page through, navigate
-  to `?...&page=N` then trigger a sort again, or read the DOM (step 6).
-
 ```js
+// 2. trigger an IN-PLACE re-fetch by clicking a sort control (re-calls /jobs/search/api/jobs via XHR)
 await (async () => {
   const el = Array.from(document.querySelectorAll('a,button,li'))
     .find(e => ['薪資待遇','本日最新','相關性'].includes((e.innerText||'').trim()));
   if (!el) return 'no-sort-control';
   el.click();
   await new Promise(r=>setTimeout(r,3000));
-  const keys = Object.keys(localStorage).filter(k=>k.startsWith('__cap_'));
-  return JSON.stringify(keys.map(k=>JSON.parse(localStorage.getItem(k))));  // [{p,s,len}] — safe scalars
+  return JSON.stringify(Object.keys(localStorage).filter(k=>k.startsWith('__cap_'))
+    .map(k=>JSON.parse(localStorage.getItem(k))));   // [{p,s,len}] — safe scalars
 })()
 ```
 
-You are looking for a capture whose `p` **ends with** `/jobs/search/api/jobs`
-with a large `len` (≈130 KB for a page of ~20 results). Always match with
-`.endsWith(...)`, never `===`: depending on how 104's axios builds the URL the
-captured path can be **protocol-relative** (`//www.104.com.tw/jobs/search/api/jobs`)
-rather than a bare `/jobs/...`. The corresponding body is in `__capb_<n>`.
+Find the capture whose `p` **ends with** `/jobs/search/api/jobs` (match with
+`.endsWith()`, never `===` — 104's axios sometimes issues protocol-relative
+`//host/path` URLs). Its body is in `__capb_<n>`. Then parse it in-page and
+return a structured projection exactly as in [step 3](#3-return-structured-data-never-one-big-string),
+or export it via Fallback B.
 
-### 4. Export the captured JSON (blob-download)
+> ⚠️ **Pagination (`下一頁`, page numbers) is a FULL PAGE RELOAD** — it wipes the
+> hook before you can read the response. To page through under this fallback,
+> navigate to `?...&page=N`, re-install the hook, and trigger a sort again.
 
-The MCP layer **blocks** large JSON return values ("Cookie/query string data"
-filter) and truncates anything over ~30 KB. The `/jobs/search/api/jobs` body is
-~133 KB, so **never return it directly** — download it to disk and read with Bash.
+## Fallback B: need the full raw payload on disk
+
+When you want the **complete raw JSON** (archival, or a payload with long fields
+that the ~1000-char return cap would clip), download it to disk and read it with
+Bash instead of returning it.
 
 ```js
+// from a captured body in localStorage (Fallback A) ...
 await (async () => {
   const i = Object.keys(localStorage).filter(k=>k.startsWith('__cap_'))
     .map(k=>[k.split('_').pop(), JSON.parse(localStorage.getItem(k))])
     .find(([n,v]) => String(v.p).endsWith('/jobs/search/api/jobs'))?.[0];
   if (i == null) return 'no-jobs-capture';
   const body = localStorage.getItem('__capb_'+i);
-  const blob = new Blob([body], {type:'application/json'});
+  // ... or, on the happy path, just: const body = JSON.stringify(await (await fetch(url,{credentials:'include'})).json());
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = '104_jobs_' + Date.now() + '.json';   // unique name; Date.now allowed in page JS
+  a.href = URL.createObjectURL(new Blob([body], {type:'application/json'}));
+  a.download = '104_jobs_' + Date.now() + '.json';
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   return 'download_initiated';
 })()
 ```
 
-Then read it from `~/Downloads/` with Bash (`ls -lt ~/Downloads | head`). The
-first download from a new origin prompts the user once; afterward it is silent
-for ~5 minutes. Once parsed and processed, see [Cleanup](#cleanup).
+Read it from `~/Downloads/` with Bash (`ls -lt ~/Downloads | head`). The first
+download from a new origin prompts the user once; afterward it is silent for
+~5 minutes. After processing, see [Cleanup](#cleanup).
 
-### 5. Parse
+## DOM fallback
 
-`/jobs/search/api/jobs` returns `{data:[...], metadata:{pagination:{total,
-currentPage, lastPage}}}`. Each `data[]` item includes (verified):
-`appearDate, applyCnt, coIndustry, coIndustryDesc, custName, custNo,
-description, jobName, salary…` and a `link` object with the job/company URLs.
-`custNo` here is the **numeric** company id.
+When the API is unavailable and you only need what's on screen, read the
+rendered DOM — it always reflects what passed Cloudflare:
 
-### 6. DOM fallback
-
-When interception is awkward (job-detail and pagination both load on navigation),
-read the rendered DOM instead — it always reflects what passed Cloudflare:
-
-- Job-search results cards: `.container-fluid.job-list-container` (around 20 per
-  page, but it varies — e.g. 22 — because of inserted promo/info cards and API
-  behavior; trust `metadata.pagination.total`, not the per-page count)
+- Search results cards: `.container-fluid.job-list-container` (~20/page, varies —
+  promo/info cards inflate the count; trust `metadata.pagination.total`)
 - Company-page job cards: `.job-list-container--cprofile`
 - Job links: `a[href*="/job/"]` → the slug is the path after `/job/`
-- Job detail body: pick the **largest** `.job-description` by `textContent.length`
-  (there are 3; the small ones are meta/footer)
+- Job-detail body: pick the **largest** `.job-description` by
+  `textContent.length` (there are ~3; the small ones are meta/footer)
 
 ## cmux browser variant
 
-Field-verified through cmux's WKWebView browser. The interception technique is
-identical; only the wrapper mechanics differ. Each surface command targets a
-surface ref (e.g. `surface:7`) returned by `open`.
+Field mechanics differ from the MCP recipe; the fetch technique is identical.
+Each command targets a surface ref (e.g. `surface:7`) returned by `open`.
 
-**Mechanics that differ from the MCP recipe:**
-
-- **`eval` has no top-level `await`.** Write every snippet as a plain
-  synchronous IIFE — `(function(){ ... })()` — not `await (async()=>{...})()`.
-  For timing, use a separate `cmux browser <surface> wait --function ...`
-  command (or a shell `sleep`) instead of an in-page `await new Promise(...)`.
-- **Single-quote URLs in the shell.** zsh interprets `?` and `&`, so wrap them:
-  `'https://www.104.com.tw/jobs/search/?keyword=python&jobsource=index_s'`.
-- **Match the captured path with `.endsWith('/jobs/search/api/jobs')`**, never
-  `===` — it can come back protocol-relative (`//www.104.com.tw/...`).
-- **`download wait` may report a timeout even though the file landed.** Don't
-  trust its result; verify on disk with `find`.
-
-### Flow
+- **`eval` has no top-level `await`.** Write a synchronous IIFE that kicks off
+  the fetch and stashes the result, then poll with a separate `wait`/`storage`
+  command — don't rely on in-page `await`.
+- **Single-quote URLs in the shell** — zsh eats `?` and `&`.
+- **`wait --function` can spuriously time out** even when the value is already
+  set (observed for the detail fetch). The fetch resolves in <1 s, so just read
+  the stashed value directly — don't abort the flow on a wait timeout.
+- Match captured paths (Fallback A) with `.endsWith('/jobs/search/api/jobs')`.
 
 ```bash
 # 1. open (quoted URL); note the returned surface ref
 cmux --json browser open 'https://www.104.com.tw/jobs/search/?keyword=python&jobsource=index_s'
-#   -> surface:7   (substitute your actual ref below)
+#   -> surface:7
 cmux browser surface:7 wait --load-state complete --timeout-ms 15000
 
-# 2. install the XHR/fetch hook (synchronous IIFE, no await)
-cmux browser surface:7 eval '(function(){if(window.__h104)return;window.__h104=true;window.__cN=0;function save(p,s,t){var i=window.__cN++;try{localStorage.setItem("__cap_"+i,JSON.stringify({p:String(p).split("?")[0].replace(/^(https?:)?\/\/[^/]+/,""),s:s,len:t.length}));localStorage.setItem("__capb_"+i,t);}catch(e){}}var of=window.fetch;window.fetch=function(){var a=arguments;return of.apply(this,a).then(function(r){try{var u=(typeof a[0]==="string"?a[0]:(a[0]&&a[0].url))||"";if((/\/api\/|\/ajax\//).test(u)&&r.ok){r.clone().text().then(function(t){save(u,r.status,t);});}}catch(e){}return r;});};var oo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){this.__u=u;return oo.apply(this,arguments);};var os=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(){var x=this;x.addEventListener("load",function(){try{var u=x.__u||"";if((/\/api\/|\/ajax\//).test(u)&&x.status>=200&&x.status<300){save(u,x.status,x.responseText||"");}}catch(e){}});return os.apply(this,arguments);};})()'
+# 2. direct fetch -> stash result in localStorage (synchronous IIFE; no await)
+cmux browser surface:7 eval '(function(){fetch("https://www.104.com.tw/jobs/search/api/jobs?keyword=python&order=16&page=1&pagesize=20&kwop=7",{headers:{"Accept":"application/json, text/plain, */*","Referer":"https://www.104.com.tw/jobs/search/"},credentials:"include"}).then(function(r){return r.text();}).then(function(t){localStorage.setItem("__104",t);}).catch(function(e){localStorage.setItem("__104","ERR:"+e);});return "started";})()'
 
-# 3. trigger an in-place sort so the app re-calls the API through the hook
-cmux browser surface:7 eval '(function(){var e=Array.prototype.find.call(document.querySelectorAll("a,button,li"),function(x){return ["薪資待遇","本日最新","相關性"].indexOf((x.innerText||"").trim())>=0;});if(e){e.click();return "clicked";}return "no-sort";})()'
+# 3. wait until the result lands
+cmux browser surface:7 wait --function 'localStorage.getItem("__104")!==null' --timeout-ms 12000
 
-# 4. wait until a jobs capture lands (replaces the in-page sleep)
-cmux browser surface:7 wait --function 'Object.keys(localStorage).some(function(k){return k.indexOf("__cap_")===0 && String(JSON.parse(localStorage.getItem(k)).p).endsWith("/jobs/search/api/jobs");})' --timeout-ms 12000
-
-# 5. inspect metadata (safe scalars only)
-cmux browser surface:7 eval '(function(){var ks=Object.keys(localStorage).filter(function(k){return k.indexOf("__cap_")===0;});return JSON.stringify(ks.map(function(k){var v=JSON.parse(localStorage.getItem(k));return {p:v.p,s:v.s,len:v.len};}));})()'
-
-# 6. blob-download the jobs payload (matches with endsWith)
-cmux browser surface:7 eval '(function(){var ks=Object.keys(localStorage).filter(function(k){return k.indexOf("__cap_")===0;});var i=null;ks.forEach(function(k){var v=JSON.parse(localStorage.getItem(k));if(String(v.p).endsWith("/jobs/search/api/jobs"))i=k.split("_").pop();});if(i===null)return "no-jobs-capture";var body=localStorage.getItem("__capb_"+i);var b=new Blob([body],{type:"application/json"});var a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="104_jobs_"+Date.now()+".json";document.body.appendChild(a);a.click();document.body.removeChild(a);return "download_initiated";})()'
-
-# 7. VERIFY ON DISK — download wait often times out even on success, so don't rely on it
-cmux browser surface:7 download wait --timeout-ms 8000 || true
-find ~/Downloads -name '104_jobs_*.json' -mmin -5
+# 4. pull it (small projection) OR blob-download for the full body
+cmux browser surface:7 eval '(function(){var j=JSON.parse(localStorage.getItem("__104"));return JSON.stringify({total:j.metadata.pagination.total,jobs:j.data.map(function(d){return {name:d.jobName,co:d.custName,slug:(String(d.link&&d.link.job).match(/\/job\/([^?]+)/)||[])[1]};})});})()'
 ```
 
-Read the newest match from `~/Downloads/` with Bash. (The body is ~130 KB; if
-cmux returns large `eval` strings cleanly on your build you can also pull it via
-`cmux browser surface:7 storage local get __capb_<i>` and skip the download.)
-Once parsed and processed, see [Cleanup](#cleanup).
+If the direct fetch 403s under cmux too, use the Fallback A hook (the
+`addinitscript` form below catches even the page's *initial* XHR):
 
-**Tip:** `cmux browser <surface> addinitscript --script '<hook>'` installs the
-hook *before* the page's own scripts run, so a fresh `open`/`reload` captures
-the **initial** API call with no sort-trigger needed. Promising for cmux but not
-yet field-verified for 104; the sort-trigger flow above is what's confirmed.
+```bash
+cmux browser surface:7 addinitscript --script '<the main-world hook from Fallback A>'
+# then reload; the initial /jobs/search/api/jobs call is captured with no sort-trigger
+```
+
+> Note: `download wait` may report a timeout even though the file landed —
+> verify on disk with `find ~/Downloads -name '104_jobs_*.json' -mmin -5`.
 
 ## Cleanup
 
-The downloaded dump in `~/Downloads/` (e.g. `104_jobs_1750000000000.json`) is
-scratch data — it is not the deliverable, just the transport for the captured
-JSON. **After you have read and processed it, remind the user that the file is
-still sitting in `~/Downloads/` and ask whether to delete it.** Never remove it
-unprompted: it lives in the user's personal Downloads folder, and a wildcard
-could catch unrelated files.
+Only relevant if you used **Fallback B**. The dump in `~/Downloads/` (e.g.
+`104_jobs_1750000000000.json`) is scratch transport, not the deliverable. **After
+reading and processing it, tell the user it's still in `~/Downloads/` and ask
+whether to delete it.** Never remove it unprompted — it's in the user's personal
+Downloads folder and a wildcard could catch unrelated files.
 
 ```bash
 # only after the user confirms — prefer the exact filename you created:
 rm "$HOME/Downloads/104_jobs_<timestamp>.json"
 ```
 
-## Endpoint reference
-
-Verified reachable **as the app's own XHR** (capture, don't blind-fetch):
-
-| Endpoint | Returns |
-|---|---|
-| `/jobs/search/api/jobs?keyword=&order=&page=&pagesize=20` | search results (`data[]` + pagination) |
-| `/jobs/search/ajax/cards` | UI flags (student/résumé cards) — not job data |
-| `/job/ajax/content/<slug>` | one job's full detail (`data.header/jobDetail/condition…`, `data.custNo` = short-code company id) |
-| `/api/companies/<cust_id>/jobs?page=1&pageSize=20` | a company's openings, paginated |
-| `/api/companies/<cust_id>/content` · `/news` · `/api/companies/ratings?custNos=` | company profile / news / ratings |
-
-`order`: `15` relevance · `16` newest · `13` salary. `cust_id` has two forms —
-short code (`1a2x6bmxfl`, used in `/company/` URLs and `/api/companies/`) vs
-numeric `custNo` (`130000000230849`). The job-detail API's `data.custNo` is the
-short code.
-
-Static reference tables need no browser (plain `fetch`/curl, no Cloudflare):
-`https://static.104.com.tw/category-tool/json/Area.json` (areas) and
-`.../JobCat.json` (job categories).
-
 ## Pitfalls
 
-- **403 on any hand-rolled request** — including from the main world. Always go
-  through the app's own XHR. There is no header set that makes a raw fetch pass.
-- **fetch vs XHR** — 104 uses axios/XHR; a `fetch`-only hook captures nothing.
-- **Protocol-relative paths** — 104's axios issues `//host/path` URLs. Normalize
-  with `^(https?:)?\/\/[^/]+` and match captured paths with `.endsWith()`, never
-  `===`, or you will miss the capture.
-- **Isolated vs main world** — `javascript_tool` runs isolated; the hook needs a
-  `<script>` injection to run in the main world. Bridge via `localStorage`/DOM.
-- **Pagination reloads** — only sort/filter are in-place; pagination navigates.
-- **Big returns get blocked/truncated** — blob-download anything over ~30 KB.
-- **JS context dies on navigation** — re-install the hook after every navigation.
+- **Try direct fetch first.** It's verified working and far simpler than the
+  capture dance. Only fall back to XHR capture on an actual 403.
+- **`credentials:"include"` is required** — without it `cf_clearance` isn't sent
+  and the request fails. And you must already be on a loaded 104 page (same-origin
+  + clearance set).
+- **Return structured data, not a big string** — each returned string value is
+  truncated at ~1000 chars. Project to arrays of short fields; chunk or
+  blob-download long fields (job descriptions).
+- **Company endpoint wants the short code**, not the numeric `custNo` — numeric
+  silently returns `totalCount: 0`.
+- **104's anti-bot is inconsistent** — the direct fetch may 200 one day and 403
+  the next. Keep Fallback A ready; re-verify before assuming either result.
+- **The REPL keeps globals between `javascript_tool` calls** — wrap each snippet
+  in an IIFE (`await (async()=>{...})()`) so `const`/`let` don't collide across
+  calls.
+- **Fallback A only**: 104 uses axios/XHR (a fetch-only hook captures nothing);
+  paths can be protocol-relative (match with `.endsWith()`); the hook runs in the
+  main world (bridge via `localStorage`); pagination is a full reload that wipes
+  the hook; re-install the hook after every navigation.
