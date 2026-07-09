@@ -1,0 +1,4 @@
+interface:
+  display_name: "LaTeX Typography Check"
+  short_description: "Lint a compiled PDF for bad line breaks: hyphen splits, punctuation or numbers at line start, runt last lines."
+  default_prompt: "Check the line-break typography of this compiled PDF and report violations with suggested LaTeX fixes."

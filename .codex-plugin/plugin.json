@@ -1,7 +1,7 @@
 {
   "name": "ai-skills",
-  "description": "Silas Hsieh's personal skill library: coupon calendar/ICS automation and resume Markdown-to-LaTeX-to-PDF sync plus 104 resume tailoring workflows.",
-  "version": "0.1.0",
+  "description": "Silas Hsieh's personal skill library: coupon calendar/ICS automation, resume Markdown-to-LaTeX-to-PDF sync, 104 resume tailoring workflows, and PDF line-break typography linting.",
+  "version": "0.2.0",
   "author": {
     "name": "Silas Hsieh"
   },
@@ -15,6 +15,7 @@
     "calendar",
     "coupon",
     "104",
+    "typography",
     "automation"
   ]
 }
