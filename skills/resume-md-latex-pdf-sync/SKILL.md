@@ -43,6 +43,12 @@ Request escalation if XeLaTeX needs system font/cache access.
 
 7. If compilation succeeds but a PDF spills to an extra page, keep the Markdown content intact and repair layout only. Prefer small spacing or margin adjustments that match the existing file style. Do not delete or rewrite resume content just to fit one page.
 8. Verify the generated PDFs with text extraction and visual rendering.
+9. After all verification checks pass (not before — the build check reads `<variant>.log`), delete the build leftovers so only `.tex` and `.pdf` remain in the `latex/` directory:
+
+```bash
+latexmk -c '<variant>.tex'
+rm -f '<variant>.xdv' '<variant>.synctex.gz'
+```
 
 ## Markdown To LaTeX Mapping
 
@@ -110,4 +116,5 @@ Keep the final response concise. Include:
 - Markdown-to-LaTeX check result.
 - Markdown-to-PDF text check result.
 - PDF page count and visual inspection result.
+- Confirmation that build leftovers were cleaned (only `.tex` and `.pdf` remain).
 - Any remaining benign warnings.
