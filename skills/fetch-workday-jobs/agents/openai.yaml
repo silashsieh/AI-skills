@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fetch Workday Jobs via the CXS JSON API"
+  short_description: "Fetch listings + full JDs from any *.myworkdayjobs.com careers site as JSON with plain curl."
+  default_prompt: "Use $fetch-workday-jobs to pull a Workday careers site's job listings and descriptions via the unauthenticated /wday/cxs JSON API (POST /jobs for listings, GET externalPath for the JD; limit caps at 20, paginate by offset)."
